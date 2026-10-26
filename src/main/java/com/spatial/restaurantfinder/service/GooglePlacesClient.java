@@ -49,10 +49,20 @@ import java.util.concurrent.TimeUnit;
  *   <li>A {@code GOOGLE_MAPS_API_KEY=...} line in a {@code .env} file in the working directory.</li>
  * </ol>
  * <p>If neither is present, construction fails with an {@link IllegalStateException} explaining how to set it.</p>
+ *
+ * <p><b>A note on complexity.</b> Everything in this class is dominated by network latency (hundreds of
+ * milliseconds per HTTP call, plus deliberate multi-second waits for pagination), not CPU work. The
+ * Big-O figures below therefore describe the local processing only, with P = number of places in a
+ * response (at most 20 per call) and R = number of HTTP requests made. The total wall-clock time is
+ * roughly R × network round-trip.</p>
+ *
+ * <p>Implements {@link AutoCloseable} so {@code Main} can use try-with-resources and the HTTP thread
+ * pool is always shut down, even if an exception is thrown.</p>
  */
 public final class GooglePlacesClient implements AutoCloseable {
 
     public static final String API_KEY_NAME = "GOOGLE_MAPS_API_KEY";
+    /** Google's maximum search radius for Nearby Search is 50 km. */
     public static final int MAX_RADIUS_METERS = 50_000;
     public static final int DEFAULT_MAX_RESULTS = 60;
     /** Google returns at most 20 results per page and at most 3 pages for Nearby Search. */
@@ -66,15 +76,26 @@ public final class GooglePlacesClient implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(GooglePlacesClient.class);
 
+    /** Shared, thread-safe client from the Google Maps Java library (used for geocoding + legacy Places). */
     private final GeoApiContext context;
+    /** Raw key, needed for the Places API (New) calls which are made with Java's own HttpClient. */
     private final String rawApiKey;
 
-    /** Creates a client using the API key resolved from the environment or {@code .env}. */
+    /**
+     * Creates a client using the API key resolved from the environment or {@code .env}.
+     * Time: O(lines in .env) for key lookup.
+     */
     public GooglePlacesClient() {
         this(resolveApiKey());
     }
 
-    /** Creates a client using an explicit API key. */
+    /**
+     * Creates a client using an explicit API key.
+     *
+     * <p>Timeouts stop the CLI from hanging forever on a bad network; {@code maxRetries} retries
+     * transient failures automatically; {@code queryRateLimit(10)} caps us at 10 requests/second so we
+     * don't trip Google's per-second quota. Time: O(1).</p>
+     */
     public GooglePlacesClient(String apiKey) {
         if (apiKey == null || apiKey.isBlank()) {
             throw new IllegalStateException("Google Maps API key is empty.");
@@ -98,9 +119,17 @@ public final class GooglePlacesClient implements AutoCloseable {
     /**
      * Resolves the API key from the environment, then from {@code ./.env}.
      *
+     * <p>Placeholder values copied from {@code .env.example} ("your-api-key-here") are treated as
+     * missing so the user gets the helpful "not found" message instead of a confusing
+     * "request denied" from Google.</p>
+     *
+     * <p>Time: O(F) where F is the total number of lines across the (at most 3) candidate .env files.
+     * Space: O(F) because each file is read fully into memory (they are tiny).</p>
+     *
      * @throws IllegalStateException when no key can be found
      */
     public static String resolveApiKey() {
+        // 1. Environment variable wins, so the key can be set without creating a file.
         String fromEnv = System.getenv(API_KEY_NAME);
         if (fromEnv != null && !fromEnv.isBlank()
                 && !fromEnv.equalsIgnoreCase("your-api-key-here")
@@ -108,6 +137,8 @@ public final class GooglePlacesClient implements AutoCloseable {
             return fromEnv.strip();
         }
 
+        // 2. Look for a .env file in a few likely places relative to where the program was started,
+        //    so it works whether you run it from the project folder, its parent, or a sub-folder.
         Path cwd = Paths.get(System.getProperty("user.dir", "."));
         List<Path> candidateEnvFiles = List.of(
                 cwd.resolve(".env"),
@@ -122,6 +153,7 @@ public final class GooglePlacesClient implements AutoCloseable {
             }
         }
 
+        // 3. Nothing found: explain exactly how to fix it.
         throw new IllegalStateException(
                 API_KEY_NAME + " not found.\n"
                         + "  Set it as an environment variable, e.g.\n"
@@ -134,6 +166,11 @@ public final class GooglePlacesClient implements AutoCloseable {
     /**
      * Minimal {@code .env} parser: supports {@code KEY=VALUE}, an optional {@code export } prefix,
      * single or double quotes around the value, blank lines and {@code #} comments.
+     *
+     * <p>Written by hand rather than pulling in a dotenv library, since we only need one key.</p>
+     *
+     * <p>Time: O(F) for F lines (each line is processed in time linear in its length).
+     * Space: O(F) for the lines read from disk.</p>
      */
     static Optional<String> readKeyFromDotEnv(Path envFile) {
         if (envFile == null || !Files.isRegularFile(envFile) || !Files.isReadable(envFile)) {
@@ -143,6 +180,7 @@ public final class GooglePlacesClient implements AutoCloseable {
         try {
             lines = Files.readAllLines(envFile, StandardCharsets.UTF_8);
         } catch (IOException e) {
+            // An unreadable file shouldn't crash the app; just try the next candidate.
             LOG.warn("Could not read {}: {}", envFile, e.getMessage());
             return Optional.empty();
         }
@@ -150,18 +188,18 @@ public final class GooglePlacesClient implements AutoCloseable {
         for (String rawLine : lines) {
             String line = rawLine.strip();
             if (line.isEmpty() || line.startsWith("#")) {
-                continue;
+                continue; // blank line or comment
             }
             if (line.startsWith("export ")) {
-                line = line.substring("export ".length()).strip();
+                line = line.substring("export ".length()).strip(); // shell-style "export KEY=VALUE"
             }
             int eq = line.indexOf('=');
             if (eq <= 0) {
-                continue;
+                continue; // no '=' or no key name before it → not a KEY=VALUE line
             }
             String key = line.substring(0, eq).strip();
             if (!API_KEY_NAME.equals(key)) {
-                continue;
+                continue; // some other variable
             }
             String value = line.substring(eq + 1).strip();
             value = stripQuotesAndComment(value);
@@ -172,16 +210,22 @@ public final class GooglePlacesClient implements AutoCloseable {
         return Optional.empty();
     }
 
+    /**
+     * Removes surrounding quotes ({@code "abc"} or {@code 'abc'}) or a trailing {@code  # comment}.
+     * Time: O(length of value).
+     */
     private static String stripQuotesAndComment(String value) {
         if (value.length() >= 2) {
             char first = value.charAt(0);
             if (first == '"' || first == '\'') {
                 int closing = value.indexOf(first, 1);
                 if (closing > 0) {
+                    // Quoted value: everything between the quotes, anything after is ignored.
                     return value.substring(1, closing).strip();
                 }
             }
         }
+        // Unquoted value: " #" starts an inline comment.
         int hash = value.indexOf(" #");
         if (hash >= 0) {
             value = value.substring(0, hash);
@@ -196,6 +240,10 @@ public final class GooglePlacesClient implements AutoCloseable {
     /**
      * Resolves an address, city or landmark to coordinates using the Geocoding API.
      *
+     * <p>Google may return several candidates; the first one is Google's best match, so we use it.</p>
+     *
+     * <p>Time: 1 HTTP request (R = 1, plus library retries on failure) + O(1) local work.</p>
+     *
      * @throws PlacesClientException when the address cannot be resolved or the API call fails
      */
     public LatLng geocodeAddress(String address) {
@@ -203,6 +251,7 @@ public final class GooglePlacesClient implements AutoCloseable {
             throw new IllegalArgumentException("Address must not be blank");
         }
         try {
+            // .await() blocks until the HTTP response arrives (synchronous call).
             GeocodingResult[] results = GeocodingApi.geocode(context, address.strip()).await();
             if (results == null || results.length == 0 || results[0].geometry == null) {
                 throw new PlacesClientException("No location found for \"" + address.strip() + "\".");
@@ -215,6 +264,7 @@ public final class GooglePlacesClient implements AutoCloseable {
         } catch (ApiException e) {
             throw translate("Geocoding", e);
         } catch (InterruptedException e) {
+            // Restore the interrupt flag so code higher up can still see the thread was interrupted.
             Thread.currentThread().interrupt();
             throw new PlacesClientException("Geocoding was interrupted.", e);
         } catch (IOException e) {
@@ -236,6 +286,13 @@ public final class GooglePlacesClient implements AutoCloseable {
      * {@code next_page_token} pagination until {@code maxResults} places are collected or
      * Google runs out of pages (max 3 pages × 20 results).
      *
+     * <p><b>Why two APIs?</b> New Google Cloud projects can only use Places API (New); older projects may
+     * only have the Legacy API enabled. Trying New first and falling back to Legacy means the app works
+     * with either kind of key.</p>
+     *
+     * <p>Time: New path = 2 HTTP requests + O(P) parsing; Legacy fallback = up to 3 requests (with
+     * ≥ 2 s waits between pages) + O(P) parsing.</p>
+     *
      * @param maxResults 1–60
      * @throws PlacesClientException when the first page fails; failures on later pages are logged and
      *                               the places collected so far are returned
@@ -253,6 +310,7 @@ public final class GooglePlacesClient implements AutoCloseable {
             LOG.debug("Places API (New) returned {} restaurant(s)", results.size());
             return results;
         } catch (PlacesClientException e) {
+            // 2. Fall back to the Legacy API if the New one is not enabled / fails.
             LOG.warn("Places API (New) failed ({}); attempting Legacy Places API fallback...", e.getMessage());
             return fetchNearbyRestaurantsLegacy(lat, lng, radiusMeters, maxResults);
         }
@@ -260,7 +318,23 @@ public final class GooglePlacesClient implements AutoCloseable {
 
     /**
      * Calls Google Maps Places API (New) — POST https://places.googleapis.com/v1/places:searchNearby
-     * Fetches both general restaurants and vegetarian restaurants to ensure rich coverage.
+     * Runs two searches: up to 20 vegetarian/vegan places, and up to 20 other restaurants.
+     *
+     * <p>Why split by diet instead of one general query? Google ranks each query by popularity and caps
+     * it at 20, so popular non-veg places would crowd small pure-veg places out of a single top 20.
+     * Google has no "non-veg" place type, so the second query asks for {@code restaurant} and
+     * <i>excludes</i> the veg/vegan types. The two groups don't overlap and together cover everything a
+     * plain "restaurant" query would return, for the same number of requests. Places from the veg query
+     * are marked veg, which is a reliable signal for the Pure Veg filter.</p>
+     *
+     * <p>Note: the New API returns at most 20 places per query and has no pagination, so this path
+     * returns up to 40 places and {@code maxResults} is not used here.</p>
+     *
+     * <p><b>Deduplication with a LinkedHashMap keyed by place id:</b> the two queries overlap, and a
+     * hash map gives O(1) average lookup/insert per place, so merging is O(P) overall instead of O(P²)
+     * for comparing every pair. "Linked" keeps insertion order, so the non-veg results stay first.</p>
+     *
+     * <p>Time: 2 HTTP requests + O(P) merge. Space: O(P).</p>
      */
     private List<Restaurant> fetchNearbyRestaurantsNew(double lat, double lng, int radiusMeters, int maxResults) {
         HttpClient client = HttpClient.newBuilder()
@@ -269,31 +343,57 @@ public final class GooglePlacesClient implements AutoCloseable {
 
         Map<String, Restaurant> merged = new LinkedHashMap<>();
 
-        // 1. Fetch general restaurants (up to 20)
-        List<Restaurant> general = searchNearbyByType(client, lat, lng, radiusMeters, "restaurant", 20);
-        for (Restaurant r : general) {
+        // 1. Non-veg side (up to 20): restaurants that Google does NOT tag as vegetarian/vegan.
+        //    This is the primary query: if it fails, the exception makes the caller try the Legacy API.
+        List<Restaurant> nonVeg = searchNearbyByType(client, lat, lng, radiusMeters,
+                List.of("restaurant"), List.of("vegetarian_restaurant", "vegan_restaurant"), false, 20);
+        for (Restaurant r : nonVeg) {
             merged.put(r.id(), r);
         }
 
-        // 2. Also fetch vegetarian restaurants (up to 20) to ensure high-quality veg options
+        // 2. Veg side (up to 20): vegetarian or vegan restaurants.
         try {
-            List<Restaurant> veg = searchNearbyByType(client, lat, lng, radiusMeters, "vegetarian_restaurant", 20);
+            List<Restaurant> veg = searchNearbyByType(client, lat, lng, radiusMeters,
+                    List.of("vegetarian_restaurant", "vegan_restaurant"), List.of(), true, 20);
             for (Restaurant r : veg) {
+                // putIfAbsent: the two groups shouldn't overlap, but if one id repeats keep the first copy.
                 merged.putIfAbsent(r.id(), r);
             }
         } catch (Exception e) {
+            // The veg query is a "nice to have": if it fails we still return the non-veg results.
             LOG.debug("Vegetarian query failed or empty: {}", e.getMessage());
         }
 
         return new ArrayList<>(merged.values());
     }
 
-    private List<Restaurant> searchNearbyByType(HttpClient client, double lat, double lng, int radiusMeters, String placeType, int maxCount) {
+    /**
+     * Performs one Places API (New) Nearby Search for a single place type and maps the JSON response
+     * into {@link Restaurant} objects.
+     *
+     * <p>The {@code X-Goog-FieldMask} header asks Google for only the fields we use. This is required by
+     * the New API and also lowers cost, because Google bills by the fields requested.</p>
+     *
+     * <p>Time: 1 HTTP request + O(P · t) to parse P places with t type tags each (t is small, so
+     * effectively O(P)). Space: O(response size).</p>
+     */
+    private List<Restaurant> searchNearbyByType(HttpClient client, double lat, double lng, int radiusMeters,
+                                                List<String> includedTypes, List<String> excludedTypes,
+                                                boolean vegQuery, int maxCount) {
+        // Google allows 1..20 results per request; clamp to that range.
         int limit = Math.max(1, Math.min(maxCount, 20));
+        // includedTypes matches places having ANY listed type; excludedTypes removes places having ANY
+        // listed type. The type names are fixed constants, so joining them into JSON is safe.
+        String included = "[\"" + String.join("\",\"", includedTypes) + "\"]";
+        String excluded = excludedTypes.isEmpty()
+                ? ""
+                : "\"excludedTypes\":[\"" + String.join("\",\"", excludedTypes) + "\"],";
+        // Locale.ROOT forces '.' as the decimal separator, otherwise some locales would write 12,97 and
+        // produce invalid JSON.
         String jsonPayload = String.format(Locale.ROOT,
-                "{\"includedTypes\":[\"%s\"],\"maxResultCount\":%d,"
+                "{\"includedTypes\":%s,%s\"maxResultCount\":%d,"
                 + "\"locationRestriction\":{\"circle\":{\"center\":{\"latitude\":%.6f,\"longitude\":%.6f},\"radius\":%.1f}}}",
-                placeType, limit, lat, lng, (double) radiusMeters);
+                included, excluded, limit, lat, lng, (double) radiusMeters);
 
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create("https://places.googleapis.com/v1/places:searchNearby"))
@@ -307,20 +407,23 @@ public final class GooglePlacesClient implements AutoCloseable {
         try {
             HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             if (response.statusCode() != 200) {
+                // Non-200 (e.g. 403 when the New API isn't enabled) → caller falls back to Legacy.
                 throw new PlacesClientException("Places API (New) HTTP " + response.statusCode() + ": " + response.body());
             }
 
+            // Parsing the JSON body is O(response size).
             JsonObject root = JsonParser.parseString(response.body()).getAsJsonObject();
             if (!root.has("places") || root.get("places").isJsonNull()) {
-                return new ArrayList<>();
+                return new ArrayList<>(); // Google omits "places" entirely when nothing is found.
             }
 
             JsonArray places = root.getAsJsonArray("places");
             List<Restaurant> list = new ArrayList<>();
-            for (JsonElement el : places) {
+            for (JsonElement el : places) { // O(P)
                 if (!el.isJsonObject()) continue;
                 JsonObject p = el.getAsJsonObject();
 
+                // Every field is optional in the response, so each one is read defensively with a fallback.
                 String id = p.has("id") ? p.get("id").getAsString() : String.format(Locale.ROOT, "place@%.7f,%.7f", lat, lng);
                 String name = "(unnamed)";
                 if (p.has("displayName") && p.getAsJsonObject("displayName").has("text")) {
@@ -339,10 +442,11 @@ public final class GooglePlacesClient implements AutoCloseable {
                     }
                 }
 
+                // A place returned by the vegetarian query is veg by definition; otherwise look for the tag.
                 List<String> typesList = new ArrayList<>();
-                boolean isVeg = "vegetarian_restaurant".equalsIgnoreCase(placeType);
+                boolean isVeg = vegQuery;
                 if (p.has("types") && p.get("types").isJsonArray()) {
-                    for (JsonElement te : p.getAsJsonArray("types")) {
+                    for (JsonElement te : p.getAsJsonArray("types")) { // O(t)
                         String t = te.getAsString();
                         typesList.add(t);
                         if ("vegetarian_restaurant".equalsIgnoreCase(t) || "vegan_restaurant".equalsIgnoreCase(t)) {
@@ -360,6 +464,7 @@ public final class GooglePlacesClient implements AutoCloseable {
                 try {
                     list.add(new Restaurant(id, name, pLat, pLng, rating, address, isVeg, typesList, cuisine));
                 } catch (IllegalArgumentException e) {
+                    // One bad record (e.g. invalid coordinates) shouldn't throw away the whole page.
                     LOG.debug("Skipping place {} with invalid data: {}", id, e.getMessage());
                 }
             }
@@ -374,13 +479,22 @@ public final class GooglePlacesClient implements AutoCloseable {
 
     /**
      * Legacy Places API search (for older Google Cloud projects).
+     *
+     * <p>Fetches page 1, then follows {@code next_page_token} for up to 3 pages in total, stopping early
+     * once {@code maxResults} unique places are collected. Places are deduplicated by id with a
+     * LinkedHashMap (O(1) average per insert, insertion order preserved).</p>
+     *
+     * <p>Time: up to 3 HTTP requests (with ≥ 2 s waits between pages, see {@link #fetchNextPage})
+     * + O(P) processing. Space: O(P).</p>
      */
     private List<Restaurant> fetchNearbyRestaurantsLegacy(double lat, double lng, int radiusMeters, int maxResults) {
+        // Never ask for more than Google can return (3 pages × 20).
         int limit = Math.max(1, Math.min(maxResults, PAGE_SIZE * MAX_PAGES));
 
         Map<String, Restaurant> byId = new LinkedHashMap<>();
         LatLng location = new LatLng(lat, lng);
 
+        // First page: errors here are fatal (there is nothing to return yet).
         PlacesSearchResponse page;
         try {
             page = PlacesApi.nearbySearchQuery(context, location)
@@ -401,6 +515,7 @@ public final class GooglePlacesClient implements AutoCloseable {
         int pagesFetched = 1;
         collect(page, byId, limit);
 
+        // Follow pagination while we still need results and Google says there are more.
         while (byId.size() < limit
                 && pagesFetched < MAX_PAGES
                 && page != null
@@ -408,7 +523,7 @@ public final class GooglePlacesClient implements AutoCloseable {
                 && !page.nextPageToken.isBlank()) {
             PlacesSearchResponse next = fetchNextPage(page.nextPageToken);
             if (next == null) {
-                break;
+                break; // later-page failures are non-fatal: keep what we have
             }
             page = next;
             pagesFetched++;
@@ -423,15 +538,19 @@ public final class GooglePlacesClient implements AutoCloseable {
      * Requests the next result page. Google rejects a token with INVALID_REQUEST until it becomes
      * active, so this waits and retries a few times before giving up.
      *
+     * <p>Time: at most {@value #NEXT_PAGE_MAX_ATTEMPTS} HTTP requests; worst-case waiting is
+     * 2 s + 4 × 1.5 s = 8 s of sleep. Space: O(P) for the page.</p>
+     *
      * @return the next page, or {@code null} when it cannot be fetched
      */
     private PlacesSearchResponse fetchNextPage(String token) {
         try {
-            Thread.sleep(NEXT_PAGE_INITIAL_DELAY_MS);
+            Thread.sleep(NEXT_PAGE_INITIAL_DELAY_MS); // token is never valid immediately
             for (int attempt = 1; attempt <= NEXT_PAGE_MAX_ATTEMPTS; attempt++) {
                 try {
                     return PlacesApi.nearbySearchNextPage(context, token).await();
                 } catch (InvalidRequestException e) {
+                    // Token not active yet: wait a bit and try again (fixed-delay retry).
                     if (attempt == NEXT_PAGE_MAX_ATTEMPTS) {
                         LOG.warn("Next page token never became valid; keeping results collected so far.");
                         return null;
@@ -450,6 +569,10 @@ public final class GooglePlacesClient implements AutoCloseable {
         return null;
     }
 
+    /**
+     * Adds the places from one page into {@code sink}, stopping as soon as {@code limit} is reached.
+     * Time: O(P) for P results on the page (O(1) average per map insert).
+     */
     private static void collect(PlacesSearchResponse page, Map<String, Restaurant> sink, int limit) {
         if (page == null || page.results == null) {
             return;
@@ -462,7 +585,12 @@ public final class GooglePlacesClient implements AutoCloseable {
         }
     }
 
-    /** Maps a Places result to the domain model, skipping entries without usable coordinates. */
+    /**
+     * Maps a Places result to the domain model, skipping entries without usable coordinates.
+     * Permanently closed places are skipped too — no point recommending them.
+     *
+     * <p>Time: O(t + L) (copying the types and resolving the cuisine).</p>
+     */
     static Optional<Restaurant> toRestaurant(PlacesSearchResult result) {
         if (result == null || result.geometry == null || result.geometry.location == null) {
             return Optional.empty();
@@ -472,6 +600,8 @@ public final class GooglePlacesClient implements AutoCloseable {
         }
         double lat = result.geometry.location.lat;
         double lng = result.geometry.location.lng;
+        // Use Google's place id when present; otherwise build a synthetic id from name + coordinates
+        // so deduplication by id still works.
         String id = (result.placeId != null && !result.placeId.isBlank())
                 ? result.placeId
                 : String.format("%s@%.7f,%.7f", result.name, lat, lng);
@@ -492,6 +622,7 @@ public final class GooglePlacesClient implements AutoCloseable {
     // Helpers
     // ------------------------------------------------------------------------------------------
 
+    /** Rejects impossible coordinates before spending an HTTP request on them. Time: O(1). */
     private static void validateCoordinates(double lat, double lng) {
         if (!Double.isFinite(lat) || lat < -90.0 || lat > 90.0) {
             throw new IllegalArgumentException("Latitude must be between -90 and 90, got " + lat);
@@ -501,6 +632,11 @@ public final class GooglePlacesClient implements AutoCloseable {
         }
     }
 
+    /**
+     * Converts the library's checked {@link ApiException} subclasses into one unchecked exception with
+     * a message a user can act on (e.g. "enable billing", "quota exceeded").
+     * Time: O(length of the error message).
+     */
     private static PlacesClientException translate(String operation, ApiException e) {
         String detail = e.getMessage() == null ? "" : e.getMessage();
         if (e instanceof RequestDeniedException) {
@@ -518,13 +654,17 @@ public final class GooglePlacesClient implements AutoCloseable {
         return new PlacesClientException(operation + " failed: " + detail, e);
     }
 
-    /** Releases the HTTP client threads held by the underlying {@link GeoApiContext}. */
+    /** Releases the HTTP client threads held by the underlying {@link GeoApiContext}. Time: O(1). */
     @Override
     public void close() {
         context.shutdown();
     }
 
-    /** Unchecked exception carrying a user-readable description of an API failure. */
+    /**
+     * Unchecked exception carrying a user-readable description of an API failure.
+     * Unchecked (RuntimeException) so callers aren't forced to declare it on every method, while
+     * {@code Main} can still catch it in one place and print the message.
+     */
     public static final class PlacesClientException extends RuntimeException {
         private static final long serialVersionUID = 1L;
 
