@@ -10,7 +10,7 @@ The application requires a Google Maps API Key with access to the **Places API**
 
 ### 1. Obtain an API Key from Google Cloud
 1. Go to the [Google Cloud Console](https://console.cloud.google.com/).
-2. Create a new project (or select an existing one) and ensure **Billing** is enabled.
+2. Create a new project (or select an existing one).
 3. In the search bar or library, enable:
    - **Places API** (or Places API New)
    - **Geocoding API**
